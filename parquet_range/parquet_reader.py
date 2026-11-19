@@ -306,6 +306,45 @@ class ParquetScanClient:
         result = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
         return result
 
+    def scan_batches(
+        self,
+        identity: ObjectIdentity,
+        columns: list[str],
+        row_groups: list[int],
+        *,
+        batch_size: int,
+        token: QueryToken | None = None,
+    ):
+        """Yield ``(row_group, RecordBatch)`` for explicit groups/columns.
+
+        Unlike :meth:`scan` this never materializes a whole row group in
+        memory: each group's column chunks are prefetched through the
+        sparse/cache layer right before that group is decoded, and PyArrow
+        yields micro-batches of at most ``batch_size`` rows.  Only the
+        requested top-level columns' chunks are ever fetched.
+        """
+        if batch_size <= 0:
+            raise BadSelectionError("batch_size must be positive")
+        metadata = read_footer(identity, self.scheduler, self.stats, token=token)
+        groups = validate_row_groups(metadata, row_groups)
+        leaves = leaf_indices_for(metadata, columns)
+        sparse = SparseObjectFile(identity, self.scheduler, token=token)
+        # Pre-parsed metadata => construction performs zero remote I/O.
+        pf = pq.ParquetFile(sparse, metadata=metadata)
+        for rg in groups:
+            # Prefetch exactly this group's chunks before decoding it.
+            ranges = column_chunk_ranges(metadata, [rg], leaves)
+            for start, end in ranges:
+                self.stats.add("range_bytes_requested", end - start)
+                self.scheduler.read(identity, start, end - start, token=token)
+            for batch in pf.iter_batches(
+                batch_size=batch_size,
+                row_groups=[rg],
+                columns=columns,
+                use_threads=False,
+            ):
+                yield rg, batch
+
 
 def _zero_column_table(rows: int) -> pa.Table:
     """A zero-column table that still carries the requested row count."""

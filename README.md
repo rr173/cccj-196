@@ -16,13 +16,18 @@
 parquet_range/   生产包（transport/cache/disk_cache/sparse_file/parquet_reader/...）
                  版本审计：diff_manifest/diff_key/diff_drift/diff_segment/
                  diff_values/diff_publish/diff_engine
+                 质量审计：quality_regex/quality_contract/quality_rules/
+                 quality_values/quality_request/quality_publish/quality_engine
 bin/pqr.py                可运行 CLI（inspect / scan / cache-clear / diff /
-                          diff-explain / serve / generate / stats）
+                          diff-explain / quality-audit / quality-explain /
+                          serve / generate / stats）
 bin/generate_large_parquet.py  大档案生成脚本
 bin/generate_diff_parquet.py   大资料左右快照 + diff 请求模板生成脚本
+bin/generate_quality_parquet.py 大资料 + 质量合约 + 审计请求模板生成脚本
 tests/           真实本地 HTTP 服务上的 pytest 套件（含屏障与故障注入，非 mock）
 docs/design.md   协议与架构设计说明
 docs/diff_design.md  版本审计（diff）设计与产物格式说明
+docs/quality_design.md 单快照质量审计设计与合约格式说明
 ```
 
 ## 快速开始
@@ -85,6 +90,71 @@ python3 bin/pqr.py diff-explain data/diff-pairs/results/report.json
 - 仅当 JSONL 完整 flush 且报告计数/校验一致才原子替换目标路径，失败不覆盖
   既有成功结果。
 
+## 单快照质量审计：合约驱动的逐行检查
+
+给定一份钉死的输入身份（规范 URL + 强 ETag + 长度）和一份 JSON 质量合约
+（必需字段及其逻辑类型 + 带稳定 ID 的行规则），系统只读取合约需要的列，
+逐行执行规则，原子产出违规明细 JSONL 与审计报告。完整契约见
+[`docs/quality_design.md`](docs/quality_design.md)。
+
+```bash
+# 1. 生成运行时大资料（多行组、有/无符号整数、NaN、时区时间、嵌套/宽列），
+#    并得到带真实 ETag/长度的合约与审计请求模板
+python3 bin/generate_quality_parquet.py data/quality-audit \
+    --rows-per-group 20000 --num-groups 8
+
+# 2. 起真实 Range 服务后运行审计（小内存/小批均可，违规流式落盘）
+python3 bin/pqr.py serve data/quality-audit --port 8765 &
+python3 bin/pqr.py --block-size 65536 quality-audit \
+    data/quality-audit/quality-audit-request.json
+
+# 3. 离线复核并按规则分页读取违规样例（不重新请求远端对象）
+python3 bin/pqr.py quality-explain \
+    data/quality-audit/results/report.json --rule score-range --limit 5
+```
+
+违规文件每行一条，字段顺序固定，按（行组、全局行号、合约规则序）稳定排列，
+同一行违反多条规则时逐条记录：
+
+```json
+{"identity":{"url":"…","etag":"\"…\"","length":…,"version_id":"…"},
+ "rule_id":"price-range","rule_kind":"range","fields":["price"],
+ "row_group":2,"row":12345,
+ "observed":{"price":{"type":"double","value":-3.5}},
+ "reason":"below_min"}
+```
+
+关键保证：
+
+- 合约在**读取行数据前**全量校验：未知规则、重复规则 ID、引用不存在字段、
+  参数类型与 Arrow 字段不相容、坏模式，全部带合约位置报错；不静默跳过、
+  不把坏合约当全部通过、不自动转换类型。合约类型须与 Parquet 顶层字段
+  **精确**匹配，字段排列不影响匹配。
+- 规则覆盖：非空、数值/时间范围（端点开闭分别指定）、枚举、字符串模式、
+  两列有序关系。null/NaN/时区/无符号语义明确一致：非空规则报告 null；
+  其余规则默认把 null/NaN 视为不适用，显式要求才计违规。
+- 字符串模式装载期编译为 NFA，每个值 `O(值长×状态数)` 有界执行，恶意
+  模式拖不垮审计。
+- 审计基于启动时验证的精确对象身份；每个 Range 请求带同一条件身份，
+  换版/412/短包/重试耗尽即失败，既有结果字节不变。
+- 明细与报告作为可恢复发布单元原子替换；崩溃后重启能识别、清理或隔离
+  未完成发布物，绝不误删上一份有效审计。
+
+### 质量审计的 Python 接口
+
+```python
+from parquet_range import (
+    RemoteParquetClient, QualityAuditEngine, QualityAuditRequest,
+    QualityContract, read_violations,
+)
+
+request = QualityAuditRequest.from_json_file("quality-audit-request.json")
+with RemoteParquetClient(disk_dir="./.cache") as client:
+    report = QualityAuditEngine(client, request).run()   # 原子发布明细 + 报告
+page = read_violations(request.report_path, rule_id="score-range",
+                       offset=0, limit=20)                # 纯本地复核，不触网
+```
+
 ## 作为库使用
 
 ```python
@@ -145,6 +215,18 @@ python3 -m pytest tests/ -q
 - 小内存下确实多段落盘、k 路归并后仍与期望一致并记录驻留峰值/RSS；取消、写出
   失败、进程终止后临时物被清理或隔离；段校验和/身份篡改被拒绝
 - 服务日志证明只取声明字段/行组，并保留条件头、区间、字节数与 206 退出状态
+
+质量审计（quality-audit）测试同样以**独立本地 PyArrow 实现为 oracle**（绝不
+调用产品规则执行器）：
+
+- 多列多规则同一行命中逐条记录、不同 Arrow 数值类型、无符号边界、时区时间、
+  null/NaN 显式语义、嵌套但未被引用的列、缺列/类型不符、坏模式、错参数，
+  全部与独立期望一致；结果按（行组、行号、规则序）确定排列，重复运行字节稳定
+- 审计中途切换版本、注入错误区间/短包/412/重试耗尽，审计失败且原有结果逐字节
+  不变；合约/schema 错误在读取行数据前失败
+- 小预算运行大于预算的数据：峰值 RSS 有界、只投影合约列、传输少于整对象；
+  取消、磁盘写失败、报告与明细发布之间强制退出后重开，恢复状态正确且旧结果
+  可读；离线分页不触网；空表/零违规报告正确；每条命令退出状态与服务日志一致
 
 ## 资源统计
 

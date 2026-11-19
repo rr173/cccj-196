@@ -129,3 +129,52 @@ class DiffPublishError(DiffError):
 
 class DiffCancelled(QueryCancelled, DiffError):
     """A diff run was cancelled; all of its temporary segments are removed."""
+
+
+# ------------------------------------------------------------- quality audit
+class QualityError(ParquetRangeError):
+    """Base class for every failure raised by the quality-audit feature."""
+
+
+class ContractError(QualityError):
+    """The quality contract is malformed, inconsistent or unsupported.
+
+    Raised before a single row of data is read.  Carries ``diagnostics``: a
+    list of ``{"location", "problem", ...}`` entries whose ``location`` is a
+    JSON-path-like position inside the contract document (for example
+    ``rules[2].min`` or ``fields.price``).
+    """
+
+    def __init__(self, message: str, diagnostics: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics: list[dict] = diagnostics or []
+
+
+class UnsupportedPatternError(ContractError):
+    """A string pattern uses regex constructs the bounded engine rejects."""
+
+
+class AuditSchemaError(QualityError):
+    """The contract does not match the Parquet file's top-level schema.
+
+    Raised after the footer is read but before any row data is fetched: a
+    declared field is missing from the file, or the contract-declared logical
+    type is not exactly the file's Arrow type.  Carries field-level
+    ``diagnostics``; field *order* differences are never an error.
+    """
+
+    def __init__(self, message: str, diagnostics: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics: list[dict] = diagnostics or []
+
+
+class AuditRequestError(QualityError):
+    """The audit request (identity / paths / limits) is malformed."""
+
+
+class AuditPublishError(QualityError):
+    """The violations/report pair could not be atomically published."""
+
+
+class AuditCancelled(QueryCancelled, QualityError):
+    """A quality audit was cancelled; its staging files are removed."""

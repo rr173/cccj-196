@@ -7,6 +7,9 @@ Subcommands:
     cache-clear  [URL]                     drop unpinned cached overlays
     diff         REQUEST.json              run a version audit between two snapshots
     diff-explain REPORT.json [--diff F]    explain an already published diff offline
+    quality-audit   REQUEST.json           audit one pinned snapshot against a contract
+    quality-explain REPORT.json [--rule R] verify a published audit offline and
+                                           page through its violations (no network)
     stats                                 show resource statistics of a run
     serve        DIR --port PORT          run the real Range test HTTP server
     generate     OUT.parquet [options]    build a large nested/dict/nulls file
@@ -27,8 +30,11 @@ from parquet_range import (  # noqa: E402
     DiffEngine,
     DiffRequest,
     ParquetRangeError,
+    QualityAuditEngine,
+    QualityAuditRequest,
     RemoteParquetClient,
     explain_diff,
+    read_violations,
 )
 from parquet_range.test_server import TestHTTPServer  # noqa: E402
 
@@ -130,6 +136,57 @@ def cmd_diff(args: argparse.Namespace) -> int:
 def cmd_diff_explain(args: argparse.Namespace) -> int:
     explanation = explain_diff(args.report, args.diff)
     print(json.dumps(explanation, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _build_quality_request(args: argparse.Namespace) -> QualityAuditRequest:
+    if args.request:
+        request = QualityAuditRequest.from_json_file(args.request)
+        raw = request.as_json()
+    else:
+        raw = {"spec_version": 1}
+    # Explicit CLI flags override (or fully supply) the request document.
+    if args.object_url:
+        raw["object"] = {
+            "url": args.object_url,
+            "etag": args.object_etag,
+            "length": args.object_length,
+        }
+    if args.contract_file:
+        raw.pop("contract", None)
+        raw["contract_path"] = args.contract_file
+    if args.violations_out:
+        raw["violations_path"] = args.violations_out
+    if args.report_out:
+        raw["report_path"] = args.report_out
+    if args.audit_batch_rows is not None:
+        raw["batch_rows"] = args.audit_batch_rows
+    return QualityAuditRequest.from_dict(raw)
+
+
+def cmd_quality_audit(args: argparse.Namespace) -> int:
+    request = _build_quality_request(args)
+    with RemoteParquetClient(disk_dir=args.cache_dir, config=_config(args)) as client:
+        engine = QualityAuditEngine(client, request)
+        report = engine.run()
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print(
+        f"\nquality audit published: {request.violations_path}\n"
+        f"report: {request.report_path}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_quality_explain(args: argparse.Namespace) -> int:
+    result = read_violations(
+        args.report,
+        args.violations,
+        rule_id=args.rule,
+        offset=args.offset,
+        limit=args.limit,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -243,6 +300,44 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--diff", help="facts path (defaults to the report's facts.path)")
     ep.set_defaults(func=cmd_diff_explain)
 
+    qp = sub.add_parser(
+        "quality-audit",
+        help="audit one pinned snapshot against a quality contract "
+             "(JSONL violations + report)",
+    )
+    qp.add_argument(
+        "request",
+        nargs="?",
+        help="JSON request file; every field can be overridden by the flags below",
+    )
+    qp.add_argument("--object-url")
+    qp.add_argument("--object-etag")
+    qp.add_argument("--object-length", type=int)
+    qp.add_argument("--contract-file", help="path to the JSON quality contract")
+    qp.add_argument("--violations-out", help="final JSONL violations path")
+    qp.add_argument("--report-out", help="final JSON audit report path")
+    qp.add_argument(
+        "--audit-batch-rows",
+        type=int,
+        help="decode/evaluate micro-batch size (bounds resident memory)",
+    )
+    qp.set_defaults(func=cmd_quality_audit)
+
+    qe = sub.add_parser(
+        "quality-explain",
+        help="verify a published quality audit offline and page its violations "
+             "(no network I/O)",
+    )
+    qe.add_argument("report")
+    qe.add_argument(
+        "--violations",
+        help="violations path (defaults to the report's violations.path)",
+    )
+    qe.add_argument("--rule", help="only show violations of this rule id")
+    qe.add_argument("--offset", type=int, default=0)
+    qe.add_argument("--limit", type=int, default=50)
+    qe.set_defaults(func=cmd_quality_explain)
+
     sp = sub.add_parser("serve", help="run the real Range HTTP test server")
     sp.add_argument("directory")
     sp.add_argument("--port", type=int, default=0)
@@ -265,6 +360,11 @@ def main(argv: list[str] | None = None) -> int:
     except ParquetRangeError as exc:
         # Distinct, scriptable exit statuses for the diff acceptance cases.
         from parquet_range import (
+            AuditCancelled,
+            AuditPublishError,
+            AuditRequestError,
+            AuditSchemaError,
+            ContractError,
             DiffCancelled,
             DiffPublishError,
             DuplicateKeyError,
@@ -275,7 +375,8 @@ def main(argv: list[str] | None = None) -> int:
             UnsupportedKeyTypeError,
         )
 
-        if isinstance(args, argparse.Namespace) and getattr(args, "command", "") == "diff":
+        command = getattr(args, "command", "") if isinstance(args, argparse.Namespace) else ""
+        if command == "diff":
             if isinstance(exc, (ManifestError,)):
                 code = 3
             elif isinstance(exc, (SchemaDriftError, UnsupportedKeyTypeError, NullKeyError,
@@ -286,6 +387,17 @@ def main(argv: list[str] | None = None) -> int:
             elif isinstance(exc, SegmentIntegrityError):
                 code = 6
             elif isinstance(exc, DiffCancelled):
+                code = 7
+            else:
+                code = 2
+        elif command == "quality-audit":
+            if isinstance(exc, (AuditRequestError, ContractError)):
+                code = 3
+            elif isinstance(exc, AuditSchemaError):
+                code = 4
+            elif isinstance(exc, AuditPublishError):
+                code = 5
+            elif isinstance(exc, AuditCancelled):
                 code = 7
             else:
                 code = 2

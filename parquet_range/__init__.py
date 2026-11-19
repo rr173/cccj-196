@@ -4,6 +4,9 @@ Public surface:
     RemoteParquetClient / ClientConfig / VersionedObject
     scan-equivalent: VersionedObject.scan(columns, row_groups) -> pyarrow.Table
     inspect, cache_clear
+    version diff: DiffEngine / DiffRequest / explain_diff
+    quality audit: QualityAuditEngine / QualityAuditRequest / QualityContract
+                   / read_violations / explain_quality
 """
 
 from .cache import BlockScheduler, QueryToken
@@ -13,8 +16,13 @@ from .diff_engine import DiffEngine, run_diff
 from .diff_manifest import DiffRequest, SnapshotManifest
 from .diff_publish import explain as explain_diff
 from .exceptions import (
+    AuditCancelled,
+    AuditPublishError,
+    AuditRequestError,
+    AuditSchemaError,
     BadSelectionError,
     BudgetExceeded,
+    ContractError,
     DiffCancelled,
     DiffError,
     DiffPublishError,
@@ -24,6 +32,7 @@ from .exceptions import (
     NullKeyError,
     ObjectValidationError,
     ParquetRangeError,
+    QualityError,
     QueryCancelled,
     RangeProtocolError,
     RangeUnsupportedError,
@@ -32,11 +41,16 @@ from .exceptions import (
     SegmentIntegrityError,
     TruncatedResponseError,
     UnsupportedKeyTypeError,
+    UnsupportedPatternError,
     VersionMismatchError,
     WeakOrMissingETagError,
 )
 from .identity import ObjectIdentity, canonical_url
 from .parquet_reader import InspectResult
+from .quality_contract import QualityContract
+from .quality_engine import QualityAuditEngine, run_quality_audit
+from .quality_publish import explain_quality, read_violations
+from .quality_request import QualityAuditRequest
 from .stats import Stats
 from .transport import HttpTransport
 
@@ -58,6 +72,13 @@ __all__ = [
     "DiffRequest",
     "SnapshotManifest",
     "explain_diff",
+    # quality-audit feature
+    "QualityAuditEngine",
+    "run_quality_audit",
+    "QualityAuditRequest",
+    "QualityContract",
+    "read_violations",
+    "explain_quality",
     "ParquetRangeError",
     "ObjectValidationError",
     "WeakOrMissingETagError",
@@ -79,6 +100,13 @@ __all__ = [
     "SegmentIntegrityError",
     "DiffPublishError",
     "DiffCancelled",
+    "QualityError",
+    "ContractError",
+    "UnsupportedPatternError",
+    "AuditSchemaError",
+    "AuditRequestError",
+    "AuditPublishError",
+    "AuditCancelled",
 ]
 
 __version__ = "1.0.0"
