@@ -9,17 +9,29 @@ Public surface:
 from .cache import BlockScheduler, QueryToken
 from .client import ClientConfig, RemoteParquetClient, VersionedObject
 from .disk_cache import DiskCache
+from .diff_engine import DiffEngine, run_diff
+from .diff_manifest import DiffRequest, SnapshotManifest
+from .diff_publish import explain as explain_diff
 from .exceptions import (
     BadSelectionError,
     BudgetExceeded,
+    DiffCancelled,
+    DiffError,
+    DiffPublishError,
+    DuplicateKeyError,
     FooterError,
+    ManifestError,
+    NullKeyError,
     ObjectValidationError,
     ParquetRangeError,
     QueryCancelled,
     RangeProtocolError,
     RangeUnsupportedError,
     RetryExhaustedError,
+    SchemaDriftError,
+    SegmentIntegrityError,
     TruncatedResponseError,
+    UnsupportedKeyTypeError,
     VersionMismatchError,
     WeakOrMissingETagError,
 )
@@ -40,6 +52,12 @@ __all__ = [
     "InspectResult",
     "Stats",
     "canonical_url",
+    # diff feature
+    "DiffEngine",
+    "run_diff",
+    "DiffRequest",
+    "SnapshotManifest",
+    "explain_diff",
     "ParquetRangeError",
     "ObjectValidationError",
     "WeakOrMissingETagError",
@@ -52,6 +70,15 @@ __all__ = [
     "QueryCancelled",
     "BudgetExceeded",
     "BadSelectionError",
+    "DiffError",
+    "ManifestError",
+    "SchemaDriftError",
+    "DuplicateKeyError",
+    "NullKeyError",
+    "UnsupportedKeyTypeError",
+    "SegmentIntegrityError",
+    "DiffPublishError",
+    "DiffCancelled",
 ]
 
 __version__ = "1.0.0"

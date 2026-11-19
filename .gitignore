@@ -1,0 +1,23 @@
+# Generated large-data artifacts and local run outputs are never committed.
+data/diff-pairs/
+**/baseline.parquet
+**/target.parquet
+**/pair-summary.json
+**/diff-request.json
+results/
+facts.jsonl
+report.json
+
+# Local caches and diff temp storage
+.parquet_range_cache/
+**/.pqr-diff-tmp/
+**/quarantine/
+*.pqrseg
+*.partial
+*.old
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/

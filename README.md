@@ -14,10 +14,15 @@
 
 ```
 parquet_range/   生产包（transport/cache/disk_cache/sparse_file/parquet_reader/...）
-bin/pqr.py                可运行 CLI（inspect / scan / cache-clear / serve / generate / stats）
+                 版本审计：diff_manifest/diff_key/diff_drift/diff_segment/
+                 diff_values/diff_publish/diff_engine
+bin/pqr.py                可运行 CLI（inspect / scan / cache-clear / diff /
+                          diff-explain / serve / generate / stats）
 bin/generate_large_parquet.py  大档案生成脚本
+bin/generate_diff_parquet.py   大资料左右快照 + diff 请求模板生成脚本
 tests/           真实本地 HTTP 服务上的 pytest 套件（含屏障与故障注入，非 mock）
 docs/design.md   协议与架构设计说明
+docs/diff_design.md  版本审计（diff）设计与产物格式说明
 ```
 
 ## 快速开始
@@ -42,6 +47,44 @@ python3 bin/pqr.py --block-size 65536 scan \
 python3 bin/pqr.py cache-clear http://127.0.0.1:8765/big.parquet
 ```
 
+## 版本审计：两份锁定快照的 diff
+
+给定基线与目标两份快照清单（规范 URL + 强 ETag + 长度），系统做键对齐的
+版本审计，原子产出 UTF-8 JSONL 差异事实与 JSON 审计报告。完整契约见
+[`docs/diff_design.md`](docs/diff_design.md)。
+
+```bash
+# 1. 生成运行时大资料左右快照（多行组、重排、insert/delete/update/no-change、
+#    嵌套/dictionary/null/空容器/二进制），并得到带 ETag/长度的请求模板
+python3 bin/generate_diff_parquet.py data/diff-pairs \
+    --rows-per-group 20000 --num-groups 8
+
+# 2. 起真实 Range 服务后，按模板里的 URL 运行（小内存会真实产生多段 spill）
+python3 bin/pqr.py --block-size 65536 diff data/diff-pairs/diff-request.json
+
+# 3. 离线复核已发布结果（不重新访问服务，重新校验 checksum/计数/顺序）
+python3 bin/pqr.py diff-explain data/diff-pairs/results/report.json
+```
+
+差异文件每行一条，字段顺序固定、按规范键稳定排序：
+
+```json
+{"kind":"update","key":{"type":"int64","value":2,"hex":"…"},"before":{…},"after":{…}}
+```
+
+关键保证：
+
+- 启动即对两侧做**条件**身份核对，之后每次取数都带对应精确 `If-Match`；
+  同一 URL 也按两个明确身份处理，412/弱 ETag/整包回退/短包/重试耗尽都判失败。
+- 键为非空顶层 Arrow 标量，编码携带**类型、长度与空值边界**，可排序且无碰撞；
+  重复键报错带来源身份、行组、行号。
+- 不假设两侧同序、不整表入内存：按批抽取 + 有界外部排序/归并，临时段带格式
+  版本、schema、双侧身份、记录数与 SHA-256；取消/异常/进程终止都会清理或隔离。
+- schema/字段类型 drift 给字段级诊断并拒绝发布，不静默转换、不补空字段、
+  不因字段排列不同而误判相等。
+- 仅当 JSONL 完整 flush 且报告计数/校验一致才原子替换目标路径，失败不覆盖
+  既有成功结果。
+
 ## 作为库使用
 
 ```python
@@ -58,6 +101,17 @@ with RemoteParquetClient(
     # 可取消的查询：取消只解除它自己的需要
     token = client.new_token()
     # ... 在另一线程调用 token.cancel()
+```
+
+### 版本审计的 Python 接口
+
+```python
+from parquet_range import RemoteParquetClient, DiffEngine, DiffRequest, explain_diff
+
+request = DiffRequest.from_json_file("diff-request.json")
+with RemoteParquetClient(disk_dir="./.cache") as client:
+    report = DiffEngine(client, request).run()      # 原子发布 facts + report
+explanation = explain_diff(request.report_path)      # 纯本地复核，不触网
 ```
 
 同 URL 换版后，旧 `obj` 的条件 GET 会收到 412/ETag 不符而失败；用
@@ -78,6 +132,19 @@ python3 -m pytest tests/ -q
 - 尾部短于最小 footer、无 Range、错误 Content-Range、短包、请求中途取消、重试耗尽
 - 缓存命中后退出重开（磁盘证据核验）、断电残片拒绝、回收时仍有读者
 - 选少量列/行组时线上传输显著小于整包（实测约整包的 2.7%）
+
+版本审计（diff）测试以**独立本地 PyArrow 实现为 oracle**（绝不调用产品 diff）：
+
+- 多行组、重排记录、insert/delete/update/no-change 的逐行事实与独立期望一致，
+  重复运行字节级稳定；嵌套 list/struct、dictionary、null、空 list/struct、二进制、
+  多种键类型（string/binary/有/无符号整数/bool）全覆盖
+- 重复键（含身份/行组/行号）、空键、schema/type drift、坏身份、412、短包、
+  重试耗尽都有明确退出状态且不产出正式结果
+- 执行到一半切换 ETag 不能把前后版本合成一份差异；同 URL 两个 ETag 作为两个
+  明确身份处理；同版本可命中隔离缓存、跨版本绝不串用
+- 小内存下确实多段落盘、k 路归并后仍与期望一致并记录驻留峰值/RSS；取消、写出
+  失败、进程终止后临时物被清理或隔离；段校验和/身份篡改被拒绝
+- 服务日志证明只取声明字段/行组，并保留条件头、区间、字节数与 206 退出状态
 
 ## 资源统计
 

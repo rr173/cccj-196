@@ -40,6 +40,30 @@ class LogEntry:
     content_range: str | None
 
 
+class VersionedObjectStore:
+    """Keeps the *full version history* of a path behind one current pointer.
+
+    A conditional request (``If-Match``) can therefore address an older
+    version even after a swap -- this lets a diff pin two explicit identities
+    of the same URL without the second pin observing the other's bytes.  The
+    default (no ``If-Match``) behaviour is unchanged: the current version is
+    served exactly as before.
+    """
+
+    def __init__(self, current: ObjectVersion) -> None:
+        self.current = current
+        self.history: dict[str, ObjectVersion] = {current.etag: current}
+
+    def swap(self, version: ObjectVersion) -> None:
+        self.history[version.etag] = version
+        self.current = version
+
+    def select(self, if_match: str | None) -> ObjectVersion:
+        if if_match is None:
+            return self.current
+        return self.history.get(if_match, self.current)
+
+
 class FaultSpec:
     """Per-request fault configuration inspected by the handler."""
 
@@ -174,16 +198,30 @@ class _Handler(BaseHTTPRequestHandler):
             return [("ETag", 'W/"weak-validator"')]
         return [("ETag", etag)]
 
-    def _current(self) -> ObjectVersion | None:
+    def _store_entry(self) -> "VersionedObjectStore | None":
         return self.store.get(urlsplit(self.path).path)
+
+    def _current(self) -> ObjectVersion | None:
+        entry = self._store_entry()
+        if entry is None:
+            return None
+        return entry.select(self.headers.get("If-Match"))
 
     # --------------------------------------------------------------- HEAD
     def do_HEAD(self) -> None:
-        obj = self._current()
-        if obj is None:
+        entry = self._store_entry()
+        if entry is None:
             self.send_error(404)
             self._record("HEAD", 404, 0, None, None)
             return
+        if_match = self.headers.get("If-Match")
+        if if_match is not None and if_match not in entry.history:
+            self.send_response(412)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            self._record("HEAD", 412, 0, entry.current.etag, None)
+            return
+        obj = entry.select(if_match)
         self.send_response(200)
         for k, v in self._etag_headers(obj.etag):
             self.send_header(k, v)
@@ -302,13 +340,28 @@ class TestHTTPServer(ThreadingHTTPServer):
     def put_object(self, path: str, data: bytes, etag: str,
                    accept_ranges: bool = True) -> None:
         with self._lock:
-            self.store[path] = ObjectVersion(bytes(data), etag, accept_ranges)
+            self.store[path] = VersionedObjectStore(
+                ObjectVersion(bytes(data), etag, accept_ranges)
+            )
 
-    def swap_version(self, path: str, data: bytes, etag: str) -> None:
+    def swap_version(self, path: str, data: bytes, etag: str, *,
+                     retain_history: bool = False) -> None:
+        """Replace the current version.
+
+        By default the old version is dropped (so stale conditional requests
+        get a real 412).  Pass ``retain_history=True`` to keep every version
+        addressable by its own ETag -- used by diff tests that pin two
+        explicit identities of the same URL simultaneously.
+        """
         with self._lock:
-            if path not in self.store:
+            entry = self.store.get(path)
+            if entry is None:
                 raise KeyError(path)
-            self.store[path] = ObjectVersion(bytes(data), etag, True)
+            new_version = ObjectVersion(bytes(data), etag, True)
+            if retain_history:
+                entry.swap(new_version)
+            else:
+                self.store[path] = VersionedObjectStore(new_version)
 
     def base_url(self) -> str:
         host, port = self.server_address[:2]

@@ -38,6 +38,23 @@ from .stats import Stats
 _RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 
+def _content_length(head) -> int:
+    length_hdr = head.headers.get("content-length")
+    if length_hdr is None:
+        raise RangeProtocolError("HEAD response lacks Content-Length")
+    try:
+        length = int(length_hdr)
+    except ValueError as exc:
+        raise RangeProtocolError(
+            f"non-integer Content-Length {length_hdr!r}"
+        ) from exc
+    if length <= 0:
+        from .exceptions import EmptyObjectError
+
+        raise EmptyObjectError(f"object reports length {length}")
+    return length
+
+
 @dataclasses.dataclass(slots=True)
 class ProbeResult:
     etag: str
@@ -82,26 +99,66 @@ class HttpTransport:
         Some servers advertise ``Accept-Ranges: bytes`` on HEAD yet return 200
         on GET, so Range ability is proven, not assumed.
         """
-        self.stats.inc("head_requests")
-        head = self._client.head(url, follow_redirects=True)
+        head = self._head(url, if_match=None)
+        etag = require_strong_etag(head.headers.get("etag"))
+        length = _content_length(head)
+        return self._prove_range(url, etag, length)
+
+    def validate_pinned(
+        self, url: str, expected_etag: str, expected_length: int
+    ) -> ProbeResult:
+        """Verify that the live object is *exactly* the manifest-declared version.
+
+        Unlike :meth:`validate_object`, every request is conditional on the
+        expected strong ETag from the snapshot manifest:
+
+        * ``HEAD`` carries ``If-Match: <expected_etag>`` -- a version that
+          changed before first contact answers 412 and the diff aborts;
+        * the one-byte Range probe likewise carries the same ``If-Match``;
+        * the observed strong ETag and entity length must equal the manifest.
+
+        This makes the two snapshots of a diff two *explicit* identities even
+        when they share a URL: probing one can never silently observe the
+        other's current bytes.
+        """
+        etag = require_strong_etag(expected_etag)
+        head = self._head(url, if_match=etag)
+        if head.status_code == 412:
+            self.stats.inc("status_412")
+            raise VersionMismatchError(
+                f"conditional HEAD for {url} returned 412: the pinned ETag "
+                f"{etag!r} no longer matches the live object"
+            )
         if head.status_code != 200:
             raise RangeProtocolError(
-                f"HEAD {url} returned {head.status_code}, expected 200"
+                f"conditional HEAD {url} returned {head.status_code}, expected 200"
             )
-        etag = require_strong_etag(head.headers.get("etag"))
-        length_hdr = head.headers.get("content-length")
-        if length_hdr is None:
-            raise RangeProtocolError("HEAD response lacks Content-Length")
-        try:
-            length = int(length_hdr)
-        except ValueError as exc:
-            raise RangeProtocolError(f"non-integer Content-Length {length_hdr!r}") from exc
-        if length <= 0:
-            from .exceptions import EmptyObjectError
+        observed_etag = require_strong_etag(head.headers.get("etag"))
+        if observed_etag != etag:
+            raise VersionMismatchError(
+                f"manifest ETag {etag!r} disagrees with live ETag {observed_etag!r}"
+            )
+        length = _content_length(head)
+        if length != expected_length:
+            raise VersionMismatchError(
+                f"manifest entity length {expected_length} disagrees with live "
+                f"Content-Length {length} for {url}"
+            )
+        result = self._prove_range(url, etag, length)
+        if result.length != expected_length or result.etag != etag:  # defensive
+            raise VersionMismatchError("pinned probe returned an unexpected identity")
+        return result
 
-            raise EmptyObjectError(f"object {url} reports length {length}")
+    def _head(self, url: str, *, if_match: str | None):
+        self.stats.inc("head_requests")
+        headers = {"If-Match": if_match} if if_match is not None else None
+        head = self._client.head(
+            url, headers=headers, follow_redirects=True
+        )
+        return head
 
-        # Probe: exactly one byte, already conditional on the strong ETag.
+    def _prove_range(self, url: str, etag: str, length: int) -> ProbeResult:
+        """One-byte conditional GET proving the server really honours Range."""
         self.stats.inc("probe_requests")
         headers = {"Range": "bytes=0-0", "If-Match": etag}
         attempt = 0
@@ -147,8 +204,7 @@ class HttpTransport:
                 f"range probe body has {len(resp.content)} bytes, expected 1"
             )
         self.stats.add("wire_bytes", len(resp.content))
-        accepts = head.headers.get("accept-ranges", "").lower() == "bytes"
-        return ProbeResult(etag=etag, length=length, accepts_ranges=accepts)
+        return ProbeResult(etag=etag, length=length, accepts_ranges=True)
 
     # ------------------------------------------------------------- data GET
     def get_range(

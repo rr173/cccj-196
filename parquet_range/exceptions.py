@@ -67,3 +67,65 @@ class EmptyObjectError(ParquetRangeError):
 
 class BadSelectionError(ParquetRangeError):
     """Caller asked for unknown columns or out-of-range row groups."""
+
+
+# --------------------------------------------------------------------- diff
+class DiffError(ParquetRangeError):
+    """Base class for every failure raised by the version-diff feature."""
+
+
+class ManifestError(DiffError):
+    """A snapshot manifest is malformed or disagrees with the server identity.
+
+    Raised before any data fetch when the canonical URL, strong ETag or entity
+    length declared in the manifest cannot be proven against the live object.
+    """
+
+
+class SchemaDriftError(DiffError):
+    """The two snapshots are not contract-compatible for the declared fields.
+
+    Carries field-level diagnostics (missing field on a side, type mismatch,
+    non-scalar key, ...).  A drift failure always aborts the diff: nothing is
+    silently cast, null-filled or re-ordered.
+    """
+
+    def __init__(self, message: str, diagnostics: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics: list[dict] = diagnostics or []
+
+
+class DuplicateKeyError(DiffError):
+    """A business key is not unique within one snapshot.
+
+    Every occurrence carries its source identity, row group and row number so
+    the offending records can be located offline.
+    """
+
+    def __init__(self, message: str, occurrences: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.occurrences: list[dict] = occurrences or []
+
+
+class NullKeyError(DiffError):
+    """A key value is null; business keys must be non-null top-level scalars."""
+
+
+class UnsupportedKeyTypeError(DiffError):
+    """The key column does not use an allowed scalar Arrow type."""
+
+
+class SegmentIntegrityError(DiffError):
+    """A spilled external-sort segment fails its format/checksum verification.
+
+    The untrusted segment is quarantined (never merged) and the diff fails
+    rather than publishing facts derived from corrupt temporary storage.
+    """
+
+
+class DiffPublishError(DiffError):
+    """The diff facts could not be atomically published to the target paths."""
+
+
+class DiffCancelled(QueryCancelled, DiffError):
+    """A diff run was cancelled; all of its temporary segments are removed."""

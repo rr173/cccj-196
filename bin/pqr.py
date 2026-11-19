@@ -5,6 +5,8 @@ Subcommands:
     inspect      URL                       show pinned identity + Parquet metadata
     scan         URL --columns a,b --row-groups 0,2 [--format json|arrow|csv]
     cache-clear  [URL]                     drop unpinned cached overlays
+    diff         REQUEST.json              run a version audit between two snapshots
+    diff-explain REPORT.json [--diff F]    explain an already published diff offline
     stats                                 show resource statistics of a run
     serve        DIR --port PORT          run the real Range test HTTP server
     generate     OUT.parquet [options]    build a large nested/dict/nulls file
@@ -20,12 +22,13 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pyarrow as pa  # noqa: E402
-
 from parquet_range import (  # noqa: E402
     ClientConfig,
+    DiffEngine,
+    DiffRequest,
     ParquetRangeError,
     RemoteParquetClient,
+    explain_diff,
 )
 from parquet_range.test_server import TestHTTPServer  # noqa: E402
 
@@ -76,6 +79,57 @@ def cmd_cache_clear(args: argparse.Namespace) -> int:
     with RemoteParquetClient(disk_dir=args.cache_dir, config=_config(args)) as client:
         freed = client.cache_clear(args.url)
         print(json.dumps(freed, indent=2))
+    return 0
+
+
+def _build_diff_request(args: argparse.Namespace) -> DiffRequest:
+    if args.request:
+        request = DiffRequest.from_json_file(args.request)
+        raw = request.as_json()
+    else:
+        raw = {"spec_version": 1}
+    # Explicit CLI flags override (or fully supply) the request document.
+    if args.left_url:
+        raw["left"] = {
+            "url": args.left_url,
+            "etag": args.left_etag,
+            "length": args.left_length,
+        }
+    if args.right_url:
+        raw["right"] = {
+            "url": args.right_url,
+            "etag": args.right_etag,
+            "length": args.right_length,
+        }
+    if args.key_column:
+        raw["key_column"] = args.key_column
+    if args.compare_columns:
+        raw["compare_columns"] = _parse_str_list(args.compare_columns)
+    if args.diff_out:
+        raw["diff_path"] = args.diff_out
+    if args.report_out:
+        raw["report_path"] = args.report_out
+    if args.diff_memory_limit is not None:
+        raw["memory_limit"] = args.diff_memory_limit
+    return DiffRequest.from_dict(raw)
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    request = _build_diff_request(args)
+    with RemoteParquetClient(disk_dir=args.cache_dir, config=_config(args)) as client:
+        engine = DiffEngine(client, request, spill_dir=args.spill_dir)
+        report = engine.run()
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print(
+        f"\ndiff published: {request.diff_path}\nreport: {request.report_path}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_diff_explain(args: argparse.Namespace) -> int:
+    explanation = explain_diff(args.report, args.diff)
+    print(json.dumps(explanation, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -154,6 +208,41 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("url", nargs="?")
     sp.set_defaults(func=cmd_cache_clear)
 
+    dp = sub.add_parser(
+        "diff",
+        help="version audit between two pinned snapshots (JSONL facts + report)",
+    )
+    dp.add_argument(
+        "request",
+        nargs="?",
+        help="JSON request file; every field can be overridden by the flags below",
+    )
+    dp.add_argument("--left-url")
+    dp.add_argument("--left-etag")
+    dp.add_argument("--left-length", type=int)
+    dp.add_argument("--right-url")
+    dp.add_argument("--right-etag")
+    dp.add_argument("--right-length", type=int)
+    dp.add_argument("--key-column")
+    dp.add_argument("--compare-columns", help="comma-separated top-level columns")
+    dp.add_argument("--diff-out", help="final JSONL facts path")
+    dp.add_argument("--report-out", help="final JSON audit report path")
+    dp.add_argument(
+        "--diff-memory-limit",
+        type=int,
+        help="per-side resident record byte ceiling (forces spill when exceeded)",
+    )
+    dp.add_argument("--spill-dir", help="explicit controlled temp-storage directory")
+    dp.set_defaults(func=cmd_diff)
+
+    ep = sub.add_parser(
+        "diff-explain",
+        help="read/verify a published diff report and facts without any network I/O",
+    )
+    ep.add_argument("report")
+    ep.add_argument("--diff", help="facts path (defaults to the report's facts.path)")
+    ep.set_defaults(func=cmd_diff_explain)
+
     sp = sub.add_parser("serve", help="run the real Range HTTP test server")
     sp.add_argument("directory")
     sp.add_argument("--port", type=int, default=0)
@@ -174,8 +263,39 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except ParquetRangeError as exc:
+        # Distinct, scriptable exit statuses for the diff acceptance cases.
+        from parquet_range import (
+            DiffCancelled,
+            DiffPublishError,
+            DuplicateKeyError,
+            ManifestError,
+            NullKeyError,
+            SchemaDriftError,
+            SegmentIntegrityError,
+            UnsupportedKeyTypeError,
+        )
+
+        if isinstance(args, argparse.Namespace) and getattr(args, "command", "") == "diff":
+            if isinstance(exc, (ManifestError,)):
+                code = 3
+            elif isinstance(exc, (SchemaDriftError, UnsupportedKeyTypeError, NullKeyError,
+                                  DuplicateKeyError)):
+                code = 4
+            elif isinstance(exc, DiffPublishError):
+                code = 5
+            elif isinstance(exc, SegmentIntegrityError):
+                code = 6
+            elif isinstance(exc, DiffCancelled):
+                code = 7
+            else:
+                code = 2
+        else:
+            code = 2
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 2
+        detail = getattr(exc, "diagnostics", None) or getattr(exc, "occurrences", None)
+        if detail:
+            print(json.dumps(detail, indent=2, ensure_ascii=False), file=sys.stderr)
+        return code
 
 
 if __name__ == "__main__":

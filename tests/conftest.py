@@ -11,6 +11,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+# Load the diff-feature fixtures/helpers as a pytest plugin so they share the
+# same collection as the rest of the suite without a second conftest.py.
+pytest_plugins = ["diff_conftest"]
+
 from parquet_range import ClientConfig, RemoteParquetClient
 from parquet_range.test_server import TestHTTPServer
 

@@ -104,6 +104,24 @@ class RemoteParquetClient:
         self._known[canon] = identity
         return VersionedObject(identity, self)
 
+    def open_identity(
+        self, url: str, expected_etag: str, expected_length: int
+    ) -> "VersionedObject":
+        """Pin the *exact* manifest-declared identity of a snapshot.
+
+        Both the conditional HEAD and the Range probe carry the expected
+        strong ETag; any 412, ETag drift or entity-length drift fails before a
+        single data byte is read.  The advisory ``_known`` table is deliberately
+        not updated, so the same URL can back two distinct snapshot identities
+        in one diff run without one pin overwriting the other.
+        """
+        canon = canonical_url(url)
+        probe = self.transport.validate_pinned(canon, expected_etag, expected_length)
+        identity = ObjectIdentity(
+            url=canon, etag=probe.etag, length=probe.length
+        )
+        return VersionedObject(identity, self)
+
     def new_token(self) -> QueryToken:
         return QueryToken(self.scheduler)
 
