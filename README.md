@@ -18,16 +18,20 @@ parquet_range/   生产包（transport/cache/disk_cache/sparse_file/parquet_read
                  diff_values/diff_publish/diff_engine
                  质量审计：quality_regex/quality_contract/quality_rules/
                  quality_values/quality_request/quality_publish/quality_engine
+                 双时间宽表：temporal_request/temporal_schema/temporal_tree/
+                 temporal_segment/temporal_publish/temporal_engine
 bin/pqr.py                可运行 CLI（inspect / scan / cache-clear / diff /
                           diff-explain / quality-audit / quality-explain /
-                          serve / generate / stats）
+                          temporal-enrich / serve / generate / stats）
 bin/generate_large_parquet.py  大档案生成脚本
 bin/generate_diff_parquet.py   大资料左右快照 + diff 请求模板生成脚本
 bin/generate_quality_parquet.py 大资料 + 质量合约 + 审计请求模板生成脚本
+bin/generate_temporal_parquet.py 偏斜双时间数据集 + 请求模板生成脚本
 tests/           真实本地 HTTP 服务上的 pytest 套件（含屏障与故障注入，非 mock）
 docs/design.md   协议与架构设计说明
 docs/diff_design.md  版本审计（diff）设计与产物格式说明
 docs/quality_design.md 单快照质量审计设计与合约格式说明
+docs/temporal_design.md 双时间物流宽表（temporal-enrich）设计与产物格式说明
 ```
 
 ## 快速开始
@@ -155,6 +159,54 @@ page = read_violations(request.report_path, rule_id="score-range",
                        offset=0, limit=20)                # 纯本地复核，不触网
 ```
 
+## 双时间物流宽表：按"当时知道到哪一刻"还原维表归属
+
+给定一份事实分片清单和一份维表修订日志分片清单（各自钉死版本），系统按
+"当时知道到哪一刻"还原每个业务键的窗口状态，把事实分片和维表修订物化成
+一份可直接用 PyArrow 读取的宽表。完整契约见
+[`docs/temporal_design.md`](docs/temporal_design.md)。
+
+```bash
+# 1. 生成偏斜数据集（热键 10 万修订 + 10 万事实，窗重叠、登记时间乱序）
+#    并得到带真实 ETag/长度的请求模板
+python3 bin/generate_temporal_parquet.py data/temporal \
+    --hot-facts 100000 --hot-windows 1000 --hot-revisions-per-window 100
+
+# 2. 起真实 Range 服务后运行（小内存会真实产生多段 spill）
+python3 bin/pqr.py serve data/temporal --port 8765 &
+python3 bin/pqr.py --block-size 65536 temporal-enrich \
+    data/temporal/temporal-request.json
+```
+
+关键保证：
+
+- 同一业务键、同一事件时间，只改"当时知道到哪一刻"，就可能得到不同的
+  服务区；最新修订移动窗口后，不能因新范围不含事件就回退到旧范围。
+- 留下的窗口只按 `priority` 取最大值：一个最高优先窗口时附上其业务列；
+  多个同优先窗口时标为 `ambiguous`（不任选赢家，即使业务列相同）；
+  完全没有时标为 `unmatched`。
+- 修订中 `(entity_key, window_id, recorded_at)` 重复是作业错误（跨分片、
+  内容完全相同、或尚未被任何事实看见，都一样），诊断须含来源位置。
+- 每条事实恰好一行，按事实清单顺序、分片内物理行顺序排列，重复事实也
+  保留；文件元数据保存分片 ID 与精确对象身份的映射。
+- 以同目录暂存后替换的方式交付单个完整 Parquet；读取失败、坏输入、
+  取消、写入失败或替换前进程中止都不能覆盖已有目标。
+
+### 双时间宽表的 Python 接口
+
+```python
+from parquet_range import (
+    RemoteParquetClient, TemporalEnrichEngine, TemporalEnrichRequest,
+)
+
+request = TemporalEnrichRequest.from_json_file("temporal-request.json")
+with RemoteParquetClient(disk_dir="./.cache") as client:
+    report = TemporalEnrichEngine(client, request).run()  # 原子发布宽表
+# 结果：单个完整 Parquet，直接用 PyArrow 读取
+import pyarrow.parquet as pq
+table = pq.read_table(request.output_path)
+```
+
 ## 作为库使用
 
 ```python
@@ -227,6 +279,18 @@ python3 -m pytest tests/ -q
 - 小预算运行大于预算的数据：峰值 RSS 有界、只投影合约列、传输少于整对象；
   取消、磁盘写失败、报告与明细发布之间强制退出后重开，恢复状态正确且旧结果
   可读；离线分页不触网；空表/零违规报告正确；每条命令退出状态与服务日志一致
+
+双时间宽表（temporal-enrich）测试以**独立本地 PyArrow 直算为 oracle**（绝不
+调用产品的窗口选择函数）：
+
+- 时序场景：A 窗口移动/撤销/重开、低优先窗口始终覆盖、高优先窗口只在其中
+  一个时刻与 A 重叠；并列计数/位置、左闭右开边界；重复事实保留、空表、
+  修订-only 键、matched-null 列与 unmatched 区分
+- 规模夹具：同一键至少十万条窗口修订和十万条事实，窗有重叠、登记时间乱序；
+  在低于处理中间数据大小的预算下完成，展示落盘工作量与内存证据；预计结果
+  由生成规律或小样本独立核对
+- 跨分片重复、对象换版、写出中断、取消、临时物清理，都核对退出结果及旧
+  目标不变；真实本地 Range 服务观察条件请求和列投影
 
 ## 资源统计
 

@@ -10,6 +10,8 @@ Subcommands:
     quality-audit   REQUEST.json           audit one pinned snapshot against a contract
     quality-explain REPORT.json [--rule R] verify a published audit offline and
                                            page through its violations (no network)
+    temporal-enrich REQUEST.json           materialize a bitemporally enriched
+                                           wide table (single Parquet)
     stats                                 show resource statistics of a run
     serve        DIR --port PORT          run the real Range test HTTP server
     generate     OUT.parquet [options]    build a large nested/dict/nulls file
@@ -33,6 +35,8 @@ from parquet_range import (  # noqa: E402
     QualityAuditEngine,
     QualityAuditRequest,
     RemoteParquetClient,
+    TemporalEnrichEngine,
+    TemporalEnrichRequest,
     explain_diff,
     read_violations,
 )
@@ -190,6 +194,28 @@ def cmd_quality_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_temporal_enrich(args: argparse.Namespace) -> int:
+    request = TemporalEnrichRequest.from_json_file(args.request)
+    if args.spill_dir:
+        # Explicit CLI override of the manifest's temp directory.
+        request = TemporalEnrichRequest.from_dict(
+            {**request.as_json(), "spill_dir": args.spill_dir}
+        )
+    with RemoteParquetClient(disk_dir=args.cache_dir, config=_config(args)) as client:
+        engine = TemporalEnrichEngine(client, request)
+        report = engine.run()
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print(
+        f"\ntemporal enrich published: {request.output_path}\n"
+        f"  rows={report['counts']['facts']} "
+        f"matched={report['counts']['matched']} "
+        f"ambiguous={report['counts']['ambiguous']} "
+        f"unmatched={report['counts']['unmatched']}",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import hashlib
 
@@ -338,6 +364,21 @@ def build_parser() -> argparse.ArgumentParser:
     qe.add_argument("--limit", type=int, default=50)
     qe.set_defaults(func=cmd_quality_explain)
 
+    tp = sub.add_parser(
+        "temporal-enrich",
+        help="materialize a bitemporally enriched wide table "
+             "(single Parquet + run statistics)",
+    )
+    tp.add_argument(
+        "request",
+        help="JSON job manifest (shard identities, columns, output, budget)",
+    )
+    tp.add_argument(
+        "--spill-dir",
+        help="override the manifest's temp directory for spilled intermediates",
+    )
+    tp.set_defaults(func=cmd_temporal_enrich)
+
     sp = sub.add_parser("serve", help="run the real Range HTTP test server")
     sp.add_argument("directory")
     sp.add_argument("--port", type=int, default=0)
@@ -372,6 +413,12 @@ def main(argv: list[str] | None = None) -> int:
             NullKeyError,
             SchemaDriftError,
             SegmentIntegrityError,
+            TemporalCancelled,
+            TemporalDataError,
+            TemporalPublishError,
+            TemporalRequestError,
+            TemporalResourceError,
+            TemporalSchemaError,
             UnsupportedKeyTypeError,
         )
 
@@ -399,6 +446,21 @@ def main(argv: list[str] | None = None) -> int:
                 code = 5
             elif isinstance(exc, AuditCancelled):
                 code = 7
+            else:
+                code = 2
+        elif command == "temporal-enrich":
+            if isinstance(exc, TemporalRequestError):
+                code = 3
+            elif isinstance(exc, TemporalSchemaError):
+                code = 4
+            elif isinstance(exc, TemporalPublishError):
+                code = 5
+            elif isinstance(exc, TemporalDataError):
+                code = 6
+            elif isinstance(exc, TemporalCancelled):
+                code = 7
+            elif isinstance(exc, TemporalResourceError):
+                code = 8
             else:
                 code = 2
         else:

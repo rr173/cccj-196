@@ -1,6 +1,7 @@
 # Generated large-data artifacts and local run outputs are never committed.
 data/diff-pairs/
 data/quality-audit/
+data/temporal/
 **/baseline.parquet
 **/target.parquet
 **/pair-summary.json
@@ -8,6 +9,8 @@ data/quality-audit/
 **/quality.parquet
 **/quality-contract.json
 **/quality-audit-request.json
+**/temporal-request.json
+**/temporal-summary.json
 results/
 facts.jsonl
 violations.jsonl
@@ -16,8 +19,11 @@ report.json
 # Local caches and diff temp storage
 .parquet_range_cache/
 **/.pqr-diff-tmp/
+**/.pqr-temporal-tmp/
 **/quarantine/
 *.pqrseg
+*.pqrtseg
+*.pqrkeybuf
 *.partial
 *.old
 

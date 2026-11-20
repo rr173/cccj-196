@@ -7,6 +7,9 @@ Public surface:
     version diff: DiffEngine / DiffRequest / explain_diff
     quality audit: QualityAuditEngine / QualityAuditRequest / QualityContract
                    / read_violations / explain_quality
+    temporal enrich: TemporalEnrichEngine / TemporalEnrichRequest
+                     (bitemporal revision resolution + window matching,
+                     materialized as a single Parquet wide table)
 """
 
 from .cache import BlockScheduler, QueryToken
@@ -39,6 +42,13 @@ from .exceptions import (
     RetryExhaustedError,
     SchemaDriftError,
     SegmentIntegrityError,
+    TemporalCancelled,
+    TemporalDataError,
+    TemporalError,
+    TemporalPublishError,
+    TemporalRequestError,
+    TemporalResourceError,
+    TemporalSchemaError,
     TruncatedResponseError,
     UnsupportedKeyTypeError,
     UnsupportedPatternError,
@@ -52,6 +62,8 @@ from .quality_engine import QualityAuditEngine, run_quality_audit
 from .quality_publish import explain_quality, read_violations
 from .quality_request import QualityAuditRequest
 from .stats import Stats
+from .temporal_engine import TemporalEnrichEngine, run_temporal_enrich
+from .temporal_request import TemporalEnrichRequest
 from .transport import HttpTransport
 
 __all__ = [
@@ -79,6 +91,10 @@ __all__ = [
     "QualityContract",
     "read_violations",
     "explain_quality",
+    # temporal-enrich feature
+    "TemporalEnrichEngine",
+    "run_temporal_enrich",
+    "TemporalEnrichRequest",
     "ParquetRangeError",
     "ObjectValidationError",
     "WeakOrMissingETagError",
@@ -107,6 +123,14 @@ __all__ = [
     "AuditRequestError",
     "AuditPublishError",
     "AuditCancelled",
+    # temporal-enrich errors
+    "TemporalError",
+    "TemporalRequestError",
+    "TemporalSchemaError",
+    "TemporalDataError",
+    "TemporalResourceError",
+    "TemporalPublishError",
+    "TemporalCancelled",
 ]
 
 __version__ = "1.0.0"

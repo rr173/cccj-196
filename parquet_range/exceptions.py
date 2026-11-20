@@ -178,3 +178,64 @@ class AuditPublishError(QualityError):
 
 class AuditCancelled(QueryCancelled, QualityError):
     """A quality audit was cancelled; its staging files are removed."""
+
+
+# ------------------------------------------------------------ temporal enrich
+class TemporalError(ParquetRangeError):
+    """Base class for every failure raised by the temporal-enrich feature."""
+
+
+class TemporalRequestError(TemporalError):
+    """The temporal-enrich job manifest is malformed.
+
+    Raised before any object is contacted: unknown keys, duplicate shard ids,
+    duplicate/reserved output columns, bad limits or paths.
+    """
+
+
+class TemporalSchemaError(TemporalError):
+    """A shard's Parquet schema violates the temporal-enrich contract.
+
+    Raised after footers are read but before any row data is fetched: a
+    required column is missing, a required column's type differs across
+    shards of one role (or across roles for the join key), or a selected
+    business column uses an unsupported type.  Carries field-level
+    ``diagnostics`` naming the shard and column.
+    """
+
+    def __init__(self, message: str, diagnostics: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics: list[dict] = diagnostics or []
+
+
+class TemporalDataError(TemporalError):
+    """A row violates the temporal-enrich data contract.
+
+    Covers null/empty join keys, null event/knowledge/registration times,
+    unknown ``op`` values, malformed ``upsert``/``withdraw`` rows and
+    duplicate ``(entity_key, window_id, recorded_at)`` revisions.  Carries
+    ``diagnostics`` with the exact source coordinates (shard id, row group,
+    global row inside the shard).
+    """
+
+    def __init__(self, message: str, diagnostics: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics: list[dict] = diagnostics or []
+
+
+class TemporalResourceError(TemporalError):
+    """The declared working-memory budget cannot hold the live working set.
+
+    The sort/reorder buffers always spill; this error is for the per-key
+    matching working set (active-window index) exceeding the metered cap
+    derived from the job's memory budget.  The job fails loudly rather than
+    silently exceeding its budget.
+    """
+
+
+class TemporalPublishError(TemporalError):
+    """The enriched wide table could not be atomically published."""
+
+
+class TemporalCancelled(QueryCancelled, TemporalError):
+    """A temporal-enrich run was cancelled; its temporary files are removed."""

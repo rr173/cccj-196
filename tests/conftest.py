@@ -11,10 +11,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-# Load the diff-feature and quality-audit fixtures/helpers as pytest plugins
-# so they share the same collection as the rest of the suite without extra
-# conftest.py files.
-pytest_plugins = ["diff_conftest", "quality_conftest"]
+# Load the diff-feature, quality-audit and temporal-enrich fixtures/helpers as
+# pytest plugins so they share the same collection as the rest of the suite
+# without extra conftest.py files.
+pytest_plugins = ["diff_conftest", "quality_conftest", "temporal_conftest"]
 
 from parquet_range import ClientConfig, RemoteParquetClient
 from parquet_range.test_server import TestHTTPServer
